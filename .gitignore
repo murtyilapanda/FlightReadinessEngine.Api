@@ -1,0 +1,47 @@
+# Ignore local development settings and GCP key file
+# Exact GCP key filename (and any extensions/variants)
+zinc-hour-460015-n7-865055c86611.json
+zinc-hour-460015-n7-865055c86611.json.*
+# Local development appsettings
+appsettings.Development.json
+
+# Build results
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+build/
+bld/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio / Rider IDE files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# .NET Core
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# NuGet
+*.nupkg
+*.snupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+
+# User-specific and secrets
+secrets.json
+*.pfx
+*.key
+
+# OS-generated files
+Thumbs.db
+.DS_Store
