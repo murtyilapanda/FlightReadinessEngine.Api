@@ -28,17 +28,20 @@ namespace FlightReadinessEngine.Api.Agents
         {
             _logger.LogInformation("--- [CREW SUBSYSTEM ENGINE] Scanning BigQuery for Table Updates ---");
 
-            List<string> targetFlightIds = ExtractTargetFlightIds(request);
-            bool isTargetedRequest = targetFlightIds.Count > 0;
-            List<string> updatedFlights = targetFlightIds.Count == 0 ? await ScanTableForChanges(targetFlightIds) : targetFlightIds;
+            List<string> inputFlightIds = ExtractTargetFlightIds(request);
+            bool isTargetedRequest = inputFlightIds.Count > 0;
+
+            // FIX: Always filter through the cache scanner. 
+            // If targeted, it checks if those specific IDs actually have new data compared to the cache.
+            List<string> updatedFlights = await ScanTableForChanges(inputFlightIds);
 
             if (!updatedFlights.Any())
             {
-                _logger.LogInformation("[CREW SUBSYSTEM] No new row changes or telemetry modifications detected.");
+                _logger.LogInformation("[CREW SUBSYSTEM] No new row changes or cache mismatches detected.");
                 return new { message = "Crew data is already completely synchronized. No analysis needed." };
             }
 
-            _logger.LogInformation($"[CREW SUBSYSTEM] Found updates for {updatedFlights.Count} flight(s): {string.Join(", ", updatedFlights)}");
+            _logger.LogInformation($"[CREW SUBSYSTEM] Processing updates for {updatedFlights.Count} flight(s): {string.Join(", ", updatedFlights)}");
             var crewAssessments = new List<object>();
 
             foreach (var flightId in updatedFlights)
@@ -47,11 +50,6 @@ namespace FlightReadinessEngine.Api.Agents
                 string structuredAgentOutput = await ExecuteCrewAgentWithTools(flightId);
                 var parsedJson = JsonSerializer.Deserialize<JsonElement>(structuredAgentOutput);
                 crewAssessments.Add(isTargetedRequest ? BuildTargetedResponse(flightId, parsedJson) : parsedJson);
-            }
-
-            if (isTargetedRequest)
-            {
-                await UpdateCacheMarkersForTails(updatedFlights);
             }
 
             return new
@@ -76,11 +74,36 @@ namespace FlightReadinessEngine.Api.Agents
             return rawValue.Split(',').Select(id => id.Trim()).Where(id => !string.IsNullOrWhiteSpace(id)).Distinct().ToList();
         }
 
+        private static object BuildTargetedResponse(string requestedTail, JsonElement assessment)
+        {
+            if (assessment.ValueKind != JsonValueKind.Object) return assessment;
+
+            string clearanceStatus = GetJsonStringProperty(assessment, "clearanceStatus");
+            string responseId = GetJsonStringProperty(assessment, "flightId");
+            string effectiveId = string.IsNullOrWhiteSpace(responseId) ? requestedTail : responseId;
+
+            if (string.Equals(clearanceStatus, "CLEARED", StringComparison.OrdinalIgnoreCase))
+            {
+                return new { flightId = effectiveId, clearanceStatus = "CLEARED", message = $"{effectiveId} is ready for dispatch. No active risks." };
+            }
+            return assessment;
+        }
+
+        private static string GetJsonStringProperty(JsonElement json, string propertyName)
+        {
+            if (json.ValueKind != JsonValueKind.Object || !json.TryGetProperty(propertyName, out var value)) return string.Empty;
+            return value.ValueKind == JsonValueKind.String ? value.GetString() ?? string.Empty : value.ToString();
+        }
+
         private async Task<List<string>> ScanTableForChanges(List<string> targetFlightIds)
         {
             BigQueryClient client = await BigQueryClient.CreateAsync(_projectId);
             var flightsWithUpdates = new List<string>();
             bool cacheUnavailable = false;
+
+            // FIX: A targeted request (specific tail(s)) must always return the latest agent status,
+            // even if the BigQuery marker matches the cache. Only untargeted scans filter by change.
+            bool isTargetedScan = targetFlightIds != null && targetFlightIds.Count > 0;
 
             string query;
             IEnumerable<BigQueryParameter> parameters;
@@ -130,7 +153,7 @@ namespace FlightReadinessEngine.Api.Agents
                     }
                 }
 
-                bool isModified = cacheUnavailable || string.IsNullOrEmpty(cachedTimestampStr) || IsMarkerNewer(currentTimestampStr, cachedTimestampStr);
+                bool isModified = isTargetedScan || cacheUnavailable || string.IsNullOrEmpty(cachedTimestampStr) || IsMarkerNewer(currentTimestampStr, cachedTimestampStr);
                 if (!isModified) continue;
 
                 flightsWithUpdates.Add(flightId);
@@ -276,60 +299,6 @@ namespace FlightReadinessEngine.Api.Agents
                 crew_report_status = row["crew_report_status"]?.ToString(),
                 crew_issue = row["crew_issue"]?.ToString()
             });
-        }
-
-        private static object BuildTargetedResponse(string requestedFlightId, JsonElement assessment)
-        {
-            if (assessment.ValueKind != JsonValueKind.Object) return assessment;
-
-            string clearanceStatus = GetJsonStringProperty(assessment, "clearanceStatus");
-            string responseId = GetJsonStringProperty(assessment, "flightId");
-            string effectiveId = string.IsNullOrWhiteSpace(responseId) ? requestedFlightId : responseId;
-
-            if (string.Equals(clearanceStatus, "CLEARED", StringComparison.OrdinalIgnoreCase))
-            {
-                return new
-                {
-                    flightId = effectiveId,
-                    clearanceStatus = "CLEARED",
-                    message = $"{effectiveId} is ready for dispatch. No active risks."
-                };
-            }
-
-            return assessment;
-        }
-
-        private static string GetJsonStringProperty(JsonElement json, string propertyName)
-        {
-            if (json.ValueKind != JsonValueKind.Object || !json.TryGetProperty(propertyName, out var value)) return string.Empty;
-            return value.ValueKind == JsonValueKind.String ? value.GetString() ?? string.Empty : value.ToString();
-        }
-
-        private async Task UpdateCacheMarkersForTails(List<string> tails)
-        {
-            try
-            {
-                BigQueryClient client = await BigQueryClient.CreateAsync(_projectId);
-
-                foreach (var tail in tails)
-                {
-                    string query = @"SELECT CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `zinc-hour-460015-n7.aviation_ops_analytics.crew_analytics` WHERE tail = @flightId";
-                    var parameters = new[] { new BigQueryParameter("flightId", BigQueryDbType.String, tail) };
-                    BigQueryResults rows = await client.ExecuteQueryAsync(query, parameters);
-
-                    var row = rows.FirstOrDefault();
-                    string marker = row?["latest_marker"]?.ToString() ?? "";
-
-                    if (!string.IsNullOrEmpty(marker))
-                    {
-                        await _cache.SetStringAsync($"crew_agent:flight:{tail}:last_seen", marker);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning($"[CREW SUBSYSTEM] Could not update cache markers after targeted request: {ex.Message}");
-            }
         }
     }
 }

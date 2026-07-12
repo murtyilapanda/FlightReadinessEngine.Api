@@ -7,7 +7,7 @@ using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 
 namespace FlightReadinessEngine.Api.Agents
-{    
+{
     public class FlightPlanningAgent
     {
         private readonly ILogger<FlightPlanningAgent> _logger;
@@ -28,31 +28,33 @@ namespace FlightReadinessEngine.Api.Agents
         {
             _logger.LogInformation("--- [FLIGHT PLANNING SUBSYSTEM ENGINE] Scanning BigQuery for Table Updates ---");
 
-            List<string> targetFlightIds = ExtractTargetFlightIds(request);
-            bool isTargetedRequest = targetFlightIds.Count > 0;
-            List<string> updatedTails = targetFlightIds.Count == 0 ? await ScanTableForChanges(targetFlightIds) : targetFlightIds;
+            List<string> inputFlightIds = ExtractTargetFlightIds(request);
+            bool isTargetedRequest = inputFlightIds.Count > 0;
+
+            // FIX: Always filter through the cache scanner. 
+            // If targeted, it checks if those specific IDs actually have new data compared to the cache.
+            List<string> updatedTails = await ScanTableForChanges(inputFlightIds);
 
             if (!updatedTails.Any())
             {
-                _logger.LogInformation("[FLIGHT PLANNING SUBSYSTEM] No new row changes detected.");
+                _logger.LogInformation("[FLIGHT PLANNING SUBSYSTEM] No new row changes or cache mismatches detected.");
                 return new { message = "Flight planning data is already synchronized. No analysis needed." };
             }
 
-            _logger.LogInformation($"[FLIGHT PLANNING SUBSYSTEM] Found updates for {updatedTails.Count} aircraft tail(s): {string.Join(", ", updatedTails)}");
+            _logger.LogInformation($"[FLIGHT PLANNING SUBSYSTEM] Processing updates for {updatedTails.Count} aircraft tail(s): {string.Join(", ", updatedTails)}");
             var planningAssessments = new List<object>();
 
             foreach (var tail in updatedTails)
             {
                 _logger.LogInformation($"[FLIGHT PLANNING SUBSYSTEM] Deploying Flight Planning Agent for Tail: {tail}...");
                 string structuredAgentOutput = await ExecuteAgentWithTools(tail);
+
                 var parsedJson = JsonSerializer.Deserialize<JsonElement>(structuredAgentOutput);
                 planningAssessments.Add(isTargetedRequest ? BuildTargetedResponse(tail, parsedJson) : parsedJson);
             }
 
-            if (isTargetedRequest)
-            {
-                await UpdateCacheMarkersForTails(updatedTails);
-            }
+            // FIX: UpdateCacheMarkersForTails is completely REMOVED. 
+            // Cache state management is now cleanly handled inside ScanTableForChanges.
 
             return new
             {
@@ -72,9 +74,11 @@ namespace FlightReadinessEngine.Api.Agents
         private static object BuildTargetedResponse(string requestedTail, JsonElement assessment)
         {
             if (assessment.ValueKind != JsonValueKind.Object) return assessment;
+
             string clearanceStatus = GetJsonStringProperty(assessment, "clearanceStatus");
             string responseId = GetJsonStringProperty(assessment, "flightId");
             string effectiveId = string.IsNullOrWhiteSpace(responseId) ? requestedTail : responseId;
+
             if (string.Equals(clearanceStatus, "CLEARED", StringComparison.OrdinalIgnoreCase))
             {
                 return new { flightId = effectiveId, clearanceStatus = "CLEARED", message = $"{effectiveId} is ready for dispatch. No active risks." };
@@ -94,9 +98,14 @@ namespace FlightReadinessEngine.Api.Agents
             var tailsWithUpdates = new List<string>();
             bool cacheUnavailable = false;
 
+            // FIX: A targeted request (specific tail(s)) must always return the latest agent status,
+            // even if the BigQuery marker matches the cache. Only untargeted scans filter by change.
+            bool isTargetedScan = targetFlightIds != null && targetFlightIds.Count > 0;
+
             string query;
             IEnumerable<BigQueryParameter> parameters;
 
+            // FIX: Properly handle BigQuery parameterized matching depending on request scope
             if (targetFlightIds == null || targetFlightIds.Count == 0)
             {
                 query = @"SELECT tail, CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `zinc-hour-460015-n7.aviation_ops_analytics.flight_planning_analytics` GROUP BY tail";
@@ -122,7 +131,8 @@ namespace FlightReadinessEngine.Api.Agents
                 if (string.IsNullOrEmpty(flightId) || string.IsNullOrEmpty(currentTimestampStr)) continue;
 
                 string cacheKey = $"flightplanning_agent:flight:{flightId}:last_seen";
-                string cachedTimestampStr = null;
+                string? cachedTimestampStr = null;
+
                 if (!cacheUnavailable)
                 {
                     try { cachedTimestampStr = await _cache.GetStringAsync(cacheKey); }
@@ -133,17 +143,19 @@ namespace FlightReadinessEngine.Api.Agents
                     }
                 }
 
-                bool isModified = cacheUnavailable || string.IsNullOrEmpty(cachedTimestampStr) || IsMarkerNewer(currentTimestampStr, cachedTimestampStr);
+                // FIX: Both targeted and automated runs compare against the exact same cache check logic
+                bool isModified = isTargetedScan || cacheUnavailable || string.IsNullOrEmpty(cachedTimestampStr) || IsMarkerNewer(currentTimestampStr, cachedTimestampStr);
                 if (!isModified) continue;
 
                 tailsWithUpdates.Add(flightId);
+
                 if (!cacheUnavailable)
                 {
                     try { await _cache.SetStringAsync(cacheKey, currentTimestampStr); }
                     catch (RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.PermissionDenied)
                     {
                         cacheUnavailable = true;
-                        _logger.LogError("[FLIGHT PLANNING SUBSYSTEM] Cache write denied.");
+                        _logger.LogError("[FLIGHT PLANNING SUBSYSTEM] Cache write failed.");
                     }
                 }
             }
@@ -230,28 +242,15 @@ namespace FlightReadinessEngine.Api.Agents
             BigQueryResults rows = await client.ExecuteQueryAsync(query, parameters);
             var row = rows.FirstOrDefault();
             if (row == null) return "{}";
-            return JsonSerializer.Serialize(new { tail = row["tail"]?.ToString(), last_updated = row["last_updated_at"]?.ToString(), flight_plan_status = row["flight_plan_status"]?.ToString(), flight_number = row["flight_number"]?.ToString(), flight_plan_issue = row["flight_plan_issue"]?.ToString() });
-        }
 
-        private async Task UpdateCacheMarkersForTails(List<string> tails)
-        {
-            try
+            return JsonSerializer.Serialize(new
             {
-                BigQueryClient client = await BigQueryClient.CreateAsync(_projectId);
-                foreach (var tail in tails)
-                {
-                    string query = @"SELECT CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `zinc-hour-460015-n7.aviation_ops_analytics.flight_planning_analytics` WHERE tail = @flightId";
-                    var parameters = new[] { new BigQueryParameter("flightId", BigQueryDbType.String, tail) };
-                    BigQueryResults rows = await client.ExecuteQueryAsync(query, parameters);
-                    var row = rows.FirstOrDefault();
-                    string marker = row?["latest_marker"]?.ToString() ?? "";
-                    if (!string.IsNullOrEmpty(marker)) await _cache.SetStringAsync($"flightplanning_agent:flight:{tail}:last_seen", marker);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning($"[FLIGHT PLANNING SUBSYSTEM] Could not update cache markers: {ex.Message}");
-            }
+                tail = row["tail"]?.ToString(),
+                last_updated = row["last_updated_at"]?.ToString(),
+                flight_plan_status = row["flight_plan_status"]?.ToString(),
+                flight_number = row["flight_number"]?.ToString(),
+                flight_plan_issue = row["flight_plan_issue"]?.ToString()
+            });
         }
     }
 }

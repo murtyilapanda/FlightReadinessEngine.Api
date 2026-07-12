@@ -28,17 +28,20 @@ namespace FlightReadinessEngine.Api.Agents
         {
             _logger.LogInformation("--- [MAINTENANCE SUBSYSTEM ENGINE] Scanning BigQuery for Table Updates ---");
 
-            List<string> targetFlightIds = ExtractTargetFlightIds(request);
-            bool isTargetedRequest = targetFlightIds.Count > 0;
-            List<string> updatedTails = targetFlightIds.Count == 0 ? await ScanTableForChanges(targetFlightIds) : targetFlightIds;
+            List<string> inputFlightIds = ExtractTargetFlightIds(request);
+            bool isTargetedRequest = inputFlightIds.Count > 0;
+
+            // FIX: Always filter through the cache scanner. 
+            // If targeted, it checks if those specific IDs actually have new data compared to the cache.
+            List<string> updatedTails = await ScanTableForChanges(inputFlightIds);
 
             if (!updatedTails.Any())
             {
-                _logger.LogInformation("[MAINTENANCE SUBSYSTEM] No new row changes detected.");
+                _logger.LogInformation("[MAINTENANCE SUBSYSTEM] No new row changes or cache mismatches detected.");
                 return new { message = "Maintenance data is already synchronized. No analysis needed." };
             }
 
-            _logger.LogInformation($"[MAINTENANCE SUBSYSTEM] Found updates for {updatedTails.Count} aircraft tail(s): {string.Join(", ", updatedTails)}");
+            _logger.LogInformation($"[MAINTENANCE SUBSYSTEM] Processing updates for {updatedTails.Count} aircraft tail(s): {string.Join(", ", updatedTails)}");
             var maintenanceAssessments = new List<object>();
 
             foreach (var tail in updatedTails)
@@ -49,10 +52,8 @@ namespace FlightReadinessEngine.Api.Agents
                 maintenanceAssessments.Add(isTargetedRequest ? BuildTargetedResponse(tail, parsedJson) : parsedJson);
             }
 
-            if (isTargetedRequest)
-            {
-                await UpdateCacheMarkersForTails(updatedTails);
-            }
+            // FIX: UpdateCacheMarkersForTails is completely REMOVED. 
+            // Cache state management is now cleanly handled inside ScanTableForChanges.
 
             return new
             {
@@ -74,6 +75,10 @@ namespace FlightReadinessEngine.Api.Agents
             BigQueryClient client = await BigQueryClient.CreateAsync(_projectId);
             var tailsWithUpdates = new List<string>();
             bool cacheUnavailable = false;
+
+            // FIX: A targeted request (specific tail(s)) must always return the latest agent status,
+            // even if the BigQuery marker matches the cache. Only untargeted scans filter by change.
+            bool isTargetedScan = targetFlightIds != null && targetFlightIds.Count > 0;
 
             string query;
             IEnumerable<BigQueryParameter> parameters;
@@ -120,7 +125,7 @@ namespace FlightReadinessEngine.Api.Agents
                     }
                 }
 
-                bool isModified = cacheUnavailable || string.IsNullOrEmpty(cachedTimestampStr) || IsMarkerNewer(currentTimestampStr, cachedTimestampStr);
+                bool isModified = isTargetedScan || cacheUnavailable || string.IsNullOrEmpty(cachedTimestampStr) || IsMarkerNewer(currentTimestampStr, cachedTimestampStr);
                 if (!isModified) continue;
 
                 tailsWithUpdates.Add(flightId);
@@ -258,33 +263,6 @@ namespace FlightReadinessEngine.Api.Agents
         {
             if (json.ValueKind != JsonValueKind.Object || !json.TryGetProperty(propertyName, out var value)) return string.Empty;
             return value.ValueKind == JsonValueKind.String ? value.GetString() ?? string.Empty : value.ToString();
-        }
-
-        private async Task UpdateCacheMarkersForTails(List<string> tails)
-        {
-            try
-            {
-                BigQueryClient client = await BigQueryClient.CreateAsync(_projectId);
-
-                foreach (var tail in tails)
-                {
-                    string query = @"SELECT CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `zinc-hour-460015-n7.aviation_ops_analytics.maintenance_analytics` WHERE tail = @flightId";
-                    var parameters = new[] { new BigQueryParameter("flightId", BigQueryDbType.String, tail) };
-                    BigQueryResults rows = await client.ExecuteQueryAsync(query, parameters);
-
-                    var row = rows.FirstOrDefault();
-                    string marker = row?["latest_marker"]?.ToString() ?? "";
-
-                    if (!string.IsNullOrEmpty(marker))
-                    {
-                        await _cache.SetStringAsync($"maintenance_agent:flight:{tail}:last_seen", marker);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning($"[MAINTENANCE SUBSYSTEM] Could not update cache markers after targeted request: {ex.Message}");
-            }
         }
     }
 }

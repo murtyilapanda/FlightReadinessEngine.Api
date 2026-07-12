@@ -12,6 +12,7 @@
 		<PackageReference Include="Google.Cloud.AIPlatform.V1" Version="3.72.0" />
 		<PackageReference Include="Google.Cloud.BigQuery.V2" Version="3.12.0" />
 		<PackageReference Include="Google.Cloud.Datastore.V1" Version="5.2.0" />
+		<PackageReference Include="Google.GenAI" Version="1.13.0" />
 	</ItemGroup>
 
 	<ItemGroup>
