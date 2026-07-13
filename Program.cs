@@ -2,6 +2,7 @@ using FlightReadinessEngine.Api.Agents;
 using FlightReadinessEngine.Api.Cache;
 using FlightReadinessEngine.Api.Master;
 using FlightReadinessEngine.Api.Services;
+using FlightReadinessEngine.Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -55,6 +56,7 @@ builder.Services.AddScoped<GroundAgent>();
 builder.Services.AddScoped<FlightPlanningAgent>();
 builder.Services.AddScoped<AircraftAgent>();
 builder.Services.AddScoped<OperationManageAgent>();
+builder.Services.AddScoped<IAgentIntentClassifier, AgentIntentClassifier>();
 
 var app = builder.Build();
 
