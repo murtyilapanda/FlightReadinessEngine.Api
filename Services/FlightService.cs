@@ -8,12 +8,12 @@ namespace FlightReadinessEngine.Api.Services
 
         public FlightService()
         {
-            _projectId = Environment.GetEnvironmentVariable("GCP_PROJECT_ID") ?? "zinc-hour-460015-n7";
+            _projectId = Environment.GetEnvironmentVariable("GCP_PROJECT_ID") ?? "qwiklabs-gcp-04-509f741dc909";
         }
 
         public async Task<List<Dictionary<string, object?>>> GetFleetReadinessSnapshotAsync()
         {
-            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId);
+            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId, GcpAuth.GetCredential());
 
             string query = $@"
                 SELECT 

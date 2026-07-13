@@ -19,6 +19,7 @@ namespace FlightReadinessEngine.Api.Agents
         private readonly AircraftAgent _aircraftAgent;
         private readonly OperationManageAgent _masterAgent;
         private readonly IAgentIntentClassifier _intentClassifier;
+        private readonly InfographicAgent _infographicAgent;
 
         public AgentController(
             ILogger<AgentController> logger,
@@ -29,7 +30,8 @@ namespace FlightReadinessEngine.Api.Agents
             FlightPlanningAgent flightPlanningAgent,
             AircraftAgent aircraftAgent,
             OperationManageAgent masterAgent,
-            IAgentIntentClassifier intentClassifier)
+            IAgentIntentClassifier intentClassifier,
+            InfographicAgent infographicAgent)
         {
             _logger = logger;
             _crewAgent = crewAgent;
@@ -40,6 +42,7 @@ namespace FlightReadinessEngine.Api.Agents
             _aircraftAgent = aircraftAgent;
             _masterAgent = masterAgent;
             _intentClassifier = intentClassifier;
+            _infographicAgent = infographicAgent;
         }
 
         [HttpPost("crew")]
@@ -425,6 +428,13 @@ namespace FlightReadinessEngine.Api.Agents
                 },
                 Timestamp = DateTime.UtcNow
             };
+        }
+
+        [HttpPost("infographic")]
+        public async Task<IActionResult> RunInfographicAgent([FromBody] AgentSyncRequest? request)
+        {
+            string html = await _infographicAgent.RunAsync(request);
+            return Content(html, "text/html; charset=utf-8");
         }
     }
 }

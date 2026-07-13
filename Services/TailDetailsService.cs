@@ -13,7 +13,7 @@ namespace FlightReadinessEngine.Api.Services
         public TailDetailsService(ILogger<TailDetailsService> logger)
         {
             _logger = logger;
-            _projectId = Environment.GetEnvironmentVariable("GCP_PROJECT_ID") ?? "zinc-hour-460015-n7";
+            _projectId = Environment.GetEnvironmentVariable("GCP_PROJECT_ID") ?? "qwiklabs-gcp-04-509f741dc909";
         }
 
         public async Task<object> GetTailDetailsAsync(string tail)
@@ -26,7 +26,7 @@ namespace FlightReadinessEngine.Api.Services
             tail = tail.Trim();
             _logger.LogInformation($"--- [L2 DRILL-DOWN] Fetching all domain table details for tail: {tail} ---");
 
-            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId);
+            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId, GcpAuth.GetCredential());
 
             // These 6 lookups are independent, so run them concurrently instead of
             // sequentially and await them all together.

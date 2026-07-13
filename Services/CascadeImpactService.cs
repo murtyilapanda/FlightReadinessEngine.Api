@@ -15,8 +15,8 @@ namespace FlightReadinessEngine.Api.Services
         public CascadeImpactService(ILogger<CascadeImpactService> logger)
         {
             _logger = logger;
-            _projectId = Environment.GetEnvironmentVariable("GCP_PROJECT_ID") ?? "zinc-hour-460015-n7";
-            _location = Environment.GetEnvironmentVariable("GCP_LOCATION") ?? "asia-south1";
+            _projectId = Environment.GetEnvironmentVariable("GCP_PROJECT_ID") ?? "qwiklabs-gcp-04-509f741dc909";
+            _location = Environment.GetEnvironmentVariable("GCP_VERTEX_LOCATION") ?? "us-central1";
         }
 
         // =====================================================================
@@ -70,7 +70,7 @@ namespace FlightReadinessEngine.Api.Services
 
         private async Task<List<Dictionary<string, object?>>> GetSnapshotRowsAsync(List<string> tails)
         {
-            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId);
+            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId, GcpAuth.GetCredential());
 
             string query = $@"
                 SELECT
@@ -96,7 +96,7 @@ namespace FlightReadinessEngine.Api.Services
         // impact against every other tail — not just the trigger tail.
         private async Task<List<Dictionary<string, object?>>> GetFleetContextAsync(List<Dictionary<string, object?>> triggerRows)
         {
-            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId);
+            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId, GcpAuth.GetCredential());
 
             var triggerTails = triggerRows.Select(r => r.GetValueOrDefault("tail")?.ToString())
                 .Where(v => !string.IsNullOrWhiteSpace(v))
@@ -145,7 +145,8 @@ namespace FlightReadinessEngine.Api.Services
         {
             var client = await new PredictionServiceClientBuilder
             {
-                Endpoint = $"{_location}-aiplatform.googleapis.com"
+                Endpoint = $"{_location}-aiplatform.googleapis.com",
+                TokenAccessMethod = GcpAuth.TokenAccessMethod
             }.BuildAsync();
 
             string triggerJson = JsonSerializer.Serialize(triggerRows);
@@ -243,7 +244,8 @@ Return ONLY the JSON object matching the required schema.";
                 }
             };
 
-            GenerateContentResponse response = await client.GenerateContentAsync(request);
+            GenerateContentResponse response = await VertexRetry.InvokeAsync(
+                () => client.GenerateContentAsync(request), _logger, "Cascade");
             return response.Candidates[0].Content.Parts[0].Text;
         }
     }

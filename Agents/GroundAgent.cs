@@ -21,7 +21,7 @@ namespace FlightReadinessEngine.Api.Agents
             _logger = logger;
             _cache = cache;
             _projectId = Environment.GetEnvironmentVariable("GCP_PROJECT_ID") ?? "";
-            _location = Environment.GetEnvironmentVariable("GCP_LOCATION") ?? "asia-south1";
+            _location = Environment.GetEnvironmentVariable("GCP_VERTEX_LOCATION") ?? "us-central1";
         }
 
         public async Task<object> RunAsync(AgentSyncRequest? request)
@@ -91,7 +91,7 @@ namespace FlightReadinessEngine.Api.Agents
 
         private async Task<List<string>> ScanTableForChanges(List<string> targetFlightIds)
         {
-            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId);
+            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId, Services.GcpAuth.GetCredential());
             var tailsWithUpdates = new List<string>();
             bool cacheUnavailable = false;
 
@@ -104,17 +104,17 @@ namespace FlightReadinessEngine.Api.Agents
 
             if (targetFlightIds == null || targetFlightIds.Count == 0)
             {
-                query = @"SELECT tail, CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `zinc-hour-460015-n7.aviation_ops_analytics.ground_analytics` GROUP BY tail";
+                query = @"SELECT tail, CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `qwiklabs-gcp-04-509f741dc909.aviation_ops_analytics.ground_analytics` GROUP BY tail";
                 parameters = Enumerable.Empty<BigQueryParameter>();
             }
             else if (targetFlightIds.Count == 1)
             {
-                query = @"SELECT tail, CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `zinc-hour-460015-n7.aviation_ops_analytics.ground_analytics` WHERE tail = @flightId GROUP BY tail";
+                query = @"SELECT tail, CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `qwiklabs-gcp-04-509f741dc909.aviation_ops_analytics.ground_analytics` WHERE tail = @flightId GROUP BY tail";
                 parameters = new[] { new BigQueryParameter("flightId", BigQueryDbType.String, targetFlightIds[0]) };
             }
             else
             {
-                query = @"SELECT tail, CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `zinc-hour-460015-n7.aviation_ops_analytics.ground_analytics` WHERE tail IN UNNEST(@flightIds) GROUP BY tail";
+                query = @"SELECT tail, CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `qwiklabs-gcp-04-509f741dc909.aviation_ops_analytics.ground_analytics` WHERE tail IN UNNEST(@flightIds) GROUP BY tail";
                 parameters = new[] { new BigQueryParameter("flightIds", BigQueryDbType.Array, targetFlightIds.ToArray()) };
             }
 
@@ -166,7 +166,11 @@ namespace FlightReadinessEngine.Api.Agents
 
         private async Task<string> ExecuteGroundAgentWithTools(string tail)
         {
-            var client = await new PredictionServiceClientBuilder { Endpoint = $"{_location}-aiplatform.googleapis.com" }.BuildAsync();
+            var client = await new PredictionServiceClientBuilder
+            {
+                Endpoint = $"{_location}-aiplatform.googleapis.com",
+                TokenAccessMethod = Services.GcpAuth.TokenAccessMethod
+            }.BuildAsync();
 
             var toolParametersSchema = new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.Object };
             toolParametersSchema.Properties.Add("flightId", new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.String, Description = "The target aircraft tail identifier" });
@@ -196,7 +200,8 @@ namespace FlightReadinessEngine.Api.Agents
                 GenerationConfig = new GenerationConfig { ResponseMimeType = "application/json", ResponseSchema = responseSchema }
             };
 
-            GenerateContentResponse response = await client.GenerateContentAsync(request);
+            GenerateContentResponse response = await Services.VertexRetry.InvokeAsync(
+                () => client.GenerateContentAsync(request), _logger, "Ground");
             Part responsePart = response.Candidates[0].Content.Parts[0];
 
             if (responsePart.FunctionCall != null)
@@ -220,7 +225,8 @@ namespace FlightReadinessEngine.Api.Agents
                     GenerationConfig = request.GenerationConfig
                 };
 
-                GenerateContentResponse finalAgentDecision = await client.GenerateContentAsync(toolResponseRequest);
+                GenerateContentResponse finalAgentDecision = await Services.VertexRetry.InvokeAsync(
+                    () => client.GenerateContentAsync(toolResponseRequest), _logger, "Ground");
                 return finalAgentDecision.Candidates[0].Content.Parts[0].Text;
             }
 
@@ -229,8 +235,8 @@ namespace FlightReadinessEngine.Api.Agents
 
         private async Task<string> TalkToGroundTable(string tail)
         {
-            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId);
-            string query = @"SELECT tail, last_updated_at, ground_ops_status, cargo_loading_complete, weight_balance_cleared, ground_ops_issue FROM `zinc-hour-460015-n7.aviation_ops_analytics.ground_analytics` WHERE tail = @flightId ORDER BY last_updated_at DESC LIMIT 1";
+            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId, Services.GcpAuth.GetCredential());
+            string query = @"SELECT tail, last_updated_at, ground_ops_status, cargo_loading_complete, weight_balance_cleared, ground_ops_issue FROM `qwiklabs-gcp-04-509f741dc909.aviation_ops_analytics.ground_analytics` WHERE tail = @flightId ORDER BY last_updated_at DESC LIMIT 1";
             var parameters = new[] { new BigQueryParameter("flightId", BigQueryDbType.String, tail) };
             BigQueryResults rows = await client.ExecuteQueryAsync(query, parameters);
             var row = rows.FirstOrDefault();

@@ -35,21 +35,39 @@ namespace FlightReadinessEngine.Api.Master
             _flightPlanningAgent = flightPlanningAgent;
             _aircraftAgent = aircraftAgent;
             _projectId = Environment.GetEnvironmentVariable("GCP_PROJECT_ID") ?? "";
-            _location = Environment.GetEnvironmentVariable("GCP_LOCATION") ?? "asia-south1";
+            _location = Environment.GetEnvironmentVariable("GCP_VERTEX_LOCATION") ?? "us-central1";
         }
 
         public async Task<object> RunAsync(AgentSyncRequest? request)
         {
             _logger.LogInformation("--- [MASTER ORCHESTRATOR] Initializing Multi-Agent Dispatch Readiness Check ---");
 
-            _logger.LogInformation("[MASTER] Deploying all domain agents concurrently...");
+            _logger.LogInformation("[MASTER] Deploying domain agents in parallel (throttled to respect Vertex AI quota)...");
 
-            var crewTask = _crewAgent.RunAsync(request);
-            var partsTask = _partsAgent.RunAsync(request);
-            var maintenanceTask = _maintenanceAgent.RunAsync(request);
-            var groundTask = _groundAgent.RunAsync(request);
-            var flightPlanningTask = _flightPlanningAgent.RunAsync(request);
-            var aircraftTask = _aircraftAgent.RunAsync(request);
+            // All six agents are dispatched in parallel. Full 6-wide concurrency bursts 12+
+            // Vertex AI calls and can trip the per-minute Gemini quota (HTTP 429 /
+            // ResourceExhausted) on constrained projects, so we cap concurrency (default 2)
+            // and retry each agent with exponential backoff on 429. Set AGENT_MAX_CONCURRENCY=6
+            // for fully parallel execution when quota allows.
+            int maxConcurrency = int.TryParse(Environment.GetEnvironmentVariable("AGENT_MAX_CONCURRENCY"), out var mc) && mc > 0
+                ? mc
+                : 2;
+
+            using var throttle = new SemaphoreSlim(maxConcurrency);
+
+            async Task<object> DispatchAsync(string domain, Func<Task<object>> agentCall)
+            {
+                await throttle.WaitAsync();
+                try { return await RunWithRetryAsync(domain, agentCall); }
+                finally { throttle.Release(); }
+            }
+
+            var crewTask = DispatchAsync("Crew", () => _crewAgent.RunAsync(request));
+            var partsTask = DispatchAsync("Parts", () => _partsAgent.RunAsync(request));
+            var maintenanceTask = DispatchAsync("Maintenance", () => _maintenanceAgent.RunAsync(request));
+            var groundTask = DispatchAsync("Ground", () => _groundAgent.RunAsync(request));
+            var flightPlanningTask = DispatchAsync("FlightPlanning", () => _flightPlanningAgent.RunAsync(request));
+            var aircraftTask = DispatchAsync("Aircraft", () => _aircraftAgent.RunAsync(request));
 
             await Task.WhenAll(crewTask, partsTask, maintenanceTask, groundTask, flightPlanningTask, aircraftTask);
 
@@ -93,11 +111,35 @@ namespace FlightReadinessEngine.Api.Master
             return aggregatedResults;
         }
 
+        // Retries an agent call when Vertex AI returns 429/ResourceExhausted,
+        // using exponential backoff (1s, 2s, 4s, 8s...).
+        private async Task<object> RunWithRetryAsync(string domain, Func<Task<object>> agentCall, int maxAttempts = 5)
+        {
+            for (int attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    return await agentCall();
+                }
+                catch (Grpc.Core.RpcException ex) when (
+                    ex.StatusCode == Grpc.Core.StatusCode.ResourceExhausted && attempt < maxAttempts)
+                {
+                    int delayMs = (int)(Math.Pow(2, attempt - 1) * 1000);
+                    _logger.LogWarning($"[MASTER] {domain} agent hit Vertex AI quota (429). Retry {attempt}/{maxAttempts - 1} in {delayMs}ms...");
+                    await Task.Delay(delayMs);
+                }
+            }
+        }
+
         private async Task<string> GenerateOrchestrationSummaryAsync(string deterministicDecision, params object[] agentResults)
         {
             try
             {
-                var client = new Client(project: _projectId, location: _location, vertexAI: true);
+                var client = new Client(
+                    project: _projectId,
+                    location: _location,
+                    vertexAI: true,
+                    credential: Services.GcpAuth.GetCredential());
 
                 string domainPayload = JsonSerializer.Serialize(agentResults);
 
@@ -106,9 +148,10 @@ namespace FlightReadinessEngine.Api.Master
                     "Maintenance, Ground, Flight Planning, Aircraft) have each returned readiness assessments. " +
                     $"The deterministic rules engine computed this decision: '{deterministicDecision}'. " +
                     "Using the domain assessments below, write a concise operations briefing (3-5 sentences) that " +
-                    "explains the overall dispatch readiness, highlights any critical HOLD_DUE_TO_RISK items and " +
-                    "their domains, and states the recommended next action. Do not contradict the deterministic " +
-                    "decision.\n\nDOMAIN ASSESSMENTS:\n" + domainPayload;
+                    "explains the overall dispatch readiness, names WHICH DOMAINS have issues (e.g. 'Maintenance and " +
+                    "Crew report holds') rather than just counts, summarizes the specific risks in those domains, and " +
+                    "states the recommended next action. Do not contradict the deterministic decision.\n\n" +
+                    "DOMAIN ASSESSMENTS:\n" + domainPayload;
 
                 var response = await client.Models.GenerateContentAsync(
                     model: ModelId,
@@ -132,41 +175,43 @@ namespace FlightReadinessEngine.Api.Master
             var criticalHolds = 0;
             var totalCleared = 0;
             var totalAssessed = 0;
+            var affectedDomains = new List<string>();
+
+            // Maps each agent's result payload property to a friendly domain name.
+            var domainByProperty = new (string Property, string Domain)[]
+            {
+                ("updatedCrewAssessments", "Crew"),
+                ("updatedPartsAssessments", "Parts"),
+                ("updatedMaintenanceAssessments", "Maintenance"),
+                ("updatedGroundAssessments", "Ground"),
+                ("updatedFlightPlanningAssessments", "Flight Planning"),
+                ("updatedAircraftAssessments", "Aircraft"),
+            };
 
             foreach (var result in agentResults)
             {
                 var jsonString = JsonSerializer.Serialize(result);
                 var doc = JsonDocument.Parse(jsonString);
 
-                if (doc.RootElement.TryGetProperty("updatedCrewAssessments", out var crewAssessments) && crewAssessments.GetArrayLength() > 0)
+                foreach (var (property, domain) in domainByProperty)
                 {
-                    totalAssessed += AnalyzeAssessments(crewAssessments, ref criticalHolds, ref totalCleared);
-                }
-                else if (doc.RootElement.TryGetProperty("updatedPartsAssessments", out var partsAssessments) && partsAssessments.GetArrayLength() > 0)
-                {
-                    totalAssessed += AnalyzeAssessments(partsAssessments, ref criticalHolds, ref totalCleared);
-                }
-                else if (doc.RootElement.TryGetProperty("updatedMaintenanceAssessments", out var maintenanceAssessments) && maintenanceAssessments.GetArrayLength() > 0)
-                {
-                    totalAssessed += AnalyzeAssessments(maintenanceAssessments, ref criticalHolds, ref totalCleared);
-                }
-                else if (doc.RootElement.TryGetProperty("updatedGroundAssessments", out var groundAssessments) && groundAssessments.GetArrayLength() > 0)
-                {
-                    totalAssessed += AnalyzeAssessments(groundAssessments, ref criticalHolds, ref totalCleared);
-                }
-                else if (doc.RootElement.TryGetProperty("updatedFlightPlanningAssessments", out var planningAssessments) && planningAssessments.GetArrayLength() > 0)
-                {
-                    totalAssessed += AnalyzeAssessments(planningAssessments, ref criticalHolds, ref totalCleared);
-                }
-                else if (doc.RootElement.TryGetProperty("updatedAircraftAssessments", out var aircraftAssessments) && aircraftAssessments.GetArrayLength() > 0)
-                {
-                    totalAssessed += AnalyzeAssessments(aircraftAssessments, ref criticalHolds, ref totalCleared);
+                    if (doc.RootElement.TryGetProperty(property, out var assessments) && assessments.GetArrayLength() > 0)
+                    {
+                        int holdsBefore = criticalHolds;
+                        totalAssessed += AnalyzeAssessments(assessments, ref criticalHolds, ref totalCleared);
+                        if (criticalHolds > holdsBefore)
+                        {
+                            affectedDomains.Add(domain);
+                        }
+                        break;
+                    }
                 }
             }
 
             if (criticalHolds > 0)
             {
-                return $"HOLD_DUE_TO_RISK ({criticalHolds} critical issue(s) detected across {totalAssessed} aircraft)";
+                string domainList = affectedDomains.Count > 0 ? string.Join(", ", affectedDomains) : "one or more domains";
+                return $"HOLD_DUE_TO_RISK ({criticalHolds} critical issue(s) detected across {affectedDomains.Count} domain(s): {domainList})";
             }
 
             if (totalCleared == totalAssessed && totalAssessed > 0)

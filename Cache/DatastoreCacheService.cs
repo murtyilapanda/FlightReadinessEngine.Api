@@ -12,7 +12,11 @@ namespace FlightReadinessEngine.Api.Cache
 
         public DatastoreCacheService(string projectId, string kind = "MultiAgentCacheMatrix")
         {
-            _db = DatastoreDb.Create(projectId);
+            _db = new DatastoreDbBuilder
+            {
+                ProjectId = projectId,
+                GoogleCredential = FlightReadinessEngine.Api.Services.GcpAuth.GetCredential()
+            }.Build();
             _kind = kind;
         }
 

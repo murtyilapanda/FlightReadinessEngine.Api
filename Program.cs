@@ -2,7 +2,6 @@ using FlightReadinessEngine.Api.Agents;
 using FlightReadinessEngine.Api.Cache;
 using FlightReadinessEngine.Api.Master;
 using FlightReadinessEngine.Api.Services;
-using FlightReadinessEngine.Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -11,8 +10,28 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+// --- GCP authentication (single global source of truth) ---
+// Preferred: Application Default Credentials (ADC). If an access token is
+// supplied (e.g. a short-lived token from Cloud Shell) it is used instead.
+// Provide the token via appsettings.json ("Gcp:AccessToken") or the
+// GCP_ACCESS_TOKEN environment variable.
+var accessToken = builder.Configuration["Gcp:AccessToken"]
+    ?? Environment.GetEnvironmentVariable("GCP_ACCESS_TOKEN");
+
+GcpAuth.Initialize(accessToken);
+
+if (GcpAuth.HasToken)
+{
+    Console.WriteLine("GCP auth: using supplied access token.");
+}
+else
+{
+    Console.WriteLine("GCP auth: using Application Default Credentials (ADC).");
+}
+
+// Legacy service-account file support (optional; only used when no token/ADC).
 var configuredCredentialsPath = builder.Configuration["Gcp:CredentialsPath"];
-if (!string.IsNullOrWhiteSpace(configuredCredentialsPath))
+if (!GcpAuth.HasToken && !string.IsNullOrWhiteSpace(configuredCredentialsPath))
 {
     if (!Path.IsPathRooted(configuredCredentialsPath))
     {
@@ -31,14 +50,22 @@ if (!string.IsNullOrWhiteSpace(configuredCredentialsPath))
 
 var projectId = builder.Configuration["Gcp:ProjectId"]
     ?? Environment.GetEnvironmentVariable("GCP_PROJECT_ID")
-    ?? "zinc-hour-460015-n7";
+    ?? "qwiklabs-gcp-04-509f741dc909";
 
 var location = builder.Configuration["Gcp:Location"]
     ?? Environment.GetEnvironmentVariable("GCP_LOCATION")
-    ?? "asia-south1";
+    ?? "US";
+
+// Vertex AI requires a specific region (e.g. us-central1). The BigQuery
+// "Location" (e.g. "US") is a multi-region and is NOT a valid Vertex host,
+// so Vertex uses its own setting.
+var vertexLocation = builder.Configuration["Gcp:VertexLocation"]
+    ?? Environment.GetEnvironmentVariable("GCP_VERTEX_LOCATION")
+    ?? "us-central1";
 
 Environment.SetEnvironmentVariable("GCP_PROJECT_ID", projectId);
 Environment.SetEnvironmentVariable("GCP_LOCATION", location);
+Environment.SetEnvironmentVariable("GCP_VERTEX_LOCATION", vertexLocation);
 
 var cacheKind = builder.Configuration["Gcp:CacheKind"]
     ?? Environment.GetEnvironmentVariable("CACHE_KIND")
@@ -56,6 +83,7 @@ builder.Services.AddScoped<GroundAgent>();
 builder.Services.AddScoped<FlightPlanningAgent>();
 builder.Services.AddScoped<AircraftAgent>();
 builder.Services.AddScoped<OperationManageAgent>();
+builder.Services.AddScoped<InfographicAgent>();
 builder.Services.AddScoped<IAgentIntentClassifier, AgentIntentClassifier>();
 
 var app = builder.Build();
