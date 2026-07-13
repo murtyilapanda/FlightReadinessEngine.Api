@@ -20,6 +20,7 @@ namespace FlightReadinessEngine.Api.Agents
         private readonly OperationManageAgent _masterAgent;
         private readonly IAgentIntentClassifier _intentClassifier;
         private readonly InfographicAgent _infographicAgent;
+        private readonly MasterChatService _masterChatService;
 
         public AgentController(
             ILogger<AgentController> logger,
@@ -31,7 +32,8 @@ namespace FlightReadinessEngine.Api.Agents
             AircraftAgent aircraftAgent,
             OperationManageAgent masterAgent,
             IAgentIntentClassifier intentClassifier,
-            InfographicAgent infographicAgent)
+            InfographicAgent infographicAgent,
+            MasterChatService masterChatService)
         {
             _logger = logger;
             _crewAgent = crewAgent;
@@ -43,6 +45,21 @@ namespace FlightReadinessEngine.Api.Agents
             _masterAgent = masterAgent;
             _intentClassifier = intentClassifier;
             _infographicAgent = infographicAgent;
+            _masterChatService = masterChatService;
+        }
+
+        /// <summary>
+        /// Unified master chatbot endpoint. Reasons over the ENTIRE consolidated
+        /// fleet_readiness_snapshot master table in a single call, using the intent
+        /// classifier to focus the answer, and returns a rich, grounded chatbot reply.
+        /// </summary>
+        [HttpPost("chat")]
+        [ProducesResponseType(typeof(MasterChatResponse), StatusCodes.Status200OK)]
+        [ProducesResponseType(typeof(MasterChatResponse), StatusCodes.Status400BadRequest)]
+        public async Task<ActionResult<MasterChatResponse>> Chat([FromBody] MasterChatRequest? request)
+        {
+            var response = await _masterChatService.AskAsync(request);
+            return response.Success ? Ok(response) : BadRequest(response);
         }
 
         [HttpPost("crew")]

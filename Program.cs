@@ -85,6 +85,7 @@ builder.Services.AddScoped<AircraftAgent>();
 builder.Services.AddScoped<OperationManageAgent>();
 builder.Services.AddScoped<InfographicAgent>();
 builder.Services.AddScoped<IAgentIntentClassifier, AgentIntentClassifier>();
+builder.Services.AddScoped<MasterChatService>();
 
 var app = builder.Build();
 
@@ -93,9 +94,11 @@ if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
     app.UseSwaggerUI();
+    // TLS is terminated by the Cloud Run proxy in production, so only
+    // redirect to HTTPS when running locally.
+    app.UseHttpsRedirection();
 }
 
-app.UseHttpsRedirection();
 app.UseAuthorization();
 app.MapControllers();
 app.Run();
