@@ -51,7 +51,7 @@ namespace FlightReadinessEngine.Api.Services
 
                 var url = $"{DigitalTwinBaseUrl}/{PartsTwinId}";
                 
-                _logger.LogInformation("[DIGITAL TWIN] Updating Parts twin - Status: {Status}, PartAvailable: {PartAvailable}", 
+                _logger.LogInformation("[DIGITAL TWIN] Updating Parts twin - Status: {Status}", 
                     status);
 
                 var response = await _httpClient.PatchAsync(url, content);
