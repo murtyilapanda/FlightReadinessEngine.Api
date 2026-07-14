@@ -73,6 +73,12 @@ var cacheKind = builder.Configuration["Gcp:CacheKind"]
 
 builder.Services.AddSingleton<IAgentCache>(_ => new DatastoreCacheService(projectId, cacheKind));
 
+// Add HttpClient for Digital Twin service
+builder.Services.AddHttpClient("DigitalTwin", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+
 builder.Services.AddScoped<FlightService>();
 builder.Services.AddScoped<CascadeImpactService>();
 builder.Services.AddScoped<TailDetailsService>();
@@ -86,6 +92,7 @@ builder.Services.AddScoped<OperationManageAgent>();
 builder.Services.AddScoped<InfographicAgent>();
 builder.Services.AddScoped<IAgentIntentClassifier, AgentIntentClassifier>();
 builder.Services.AddScoped<MasterChatService>();
+builder.Services.AddScoped<IDigitalTwinService, DigitalTwinService>();
 
 var app = builder.Build();
 
