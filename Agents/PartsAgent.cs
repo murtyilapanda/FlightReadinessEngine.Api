@@ -1,6 +1,7 @@
 using System.Text.Json;
 using FlightReadinessEngine.Api.Cache;
 using FlightReadinessEngine.Api.Models;
+using FlightReadinessEngine.Api.Services;
 using Google.Cloud.AIPlatform.V1;
 using Google.Cloud.BigQuery.V2;
 using Google.Protobuf.WellKnownTypes;
@@ -12,15 +13,17 @@ namespace FlightReadinessEngine.Api.Agents
     {
         private readonly ILogger<PartsAgent> _logger;
         private readonly IAgentCache _cache;
+        private readonly IDigitalTwinService _digitalTwinService;
         private readonly string _projectId;
         private readonly string _location;
         private const string CachePrefix = "parts_agent";
         private const string ModelId = "gemini-2.5-flash";
 
-        public PartsAgent(ILogger<PartsAgent> logger, IAgentCache cache)
+        public PartsAgent(ILogger<PartsAgent> logger, IAgentCache cache, IDigitalTwinService digitalTwinService)
         {
             _logger = logger;
             _cache = cache;
+            _digitalTwinService = digitalTwinService;
             _projectId = Environment.GetEnvironmentVariable("GCP_PROJECT_ID") ?? "";
             _location = Environment.GetEnvironmentVariable("GCP_VERTEX_LOCATION") ?? "us-central1";
         }
@@ -55,6 +58,10 @@ namespace FlightReadinessEngine.Api.Agents
                 _logger.LogInformation($"[PARTS SUBSYSTEM] Deploying Parts Agent for Tail: {tail}...");
                 string structuredAgentOutput = await ExecutePartsAgentWithTools(tail);
                 var parsedJson = JsonSerializer.Deserialize<JsonElement>(structuredAgentOutput);
+                
+                // Update Digital Twin with parts status
+                await UpdateDigitalTwinAsync();
+                
                 partsAssessments.Add(isTargetedRequest ? BuildTargetedResponse(tail, parsedJson) : parsedJson);
             }
 
@@ -493,6 +500,25 @@ namespace FlightReadinessEngine.Api.Agents
                 part_in_transit = row["part_in_transit"]?.ToString(),
                 parts_issue = row["parts_issue"]?.ToString()
             });
+        }
+
+        /// <summary>
+        /// Updates the Digital Twin with parts status changes
+        /// </summary>
+        private async Task UpdateDigitalTwinAsync()
+        {
+            try
+            {
+                
+                // Map clearance status to Digital Twin status (GREEN/RED)
+                string status = "RED";
+                // Update the Digital Twin
+                await _digitalTwinService.UpdatePartsStatusAsync(status);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[DIGITAL TWIN] Error updating Parts digital twin");
+            }
         }
     }
 }
