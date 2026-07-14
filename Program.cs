@@ -90,10 +90,13 @@ builder.Services.AddScoped<MasterChatService>();
 var app = builder.Build();
 
 // Configure the HTTP request pipeline.
+// Swagger is exposed in all environments (including Cloud Run) so the API
+// surface is discoverable at /swagger.
+app.UseSwagger();
+app.UseSwaggerUI();
+
 if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
     // TLS is terminated by the Cloud Run proxy in production, so only
     // redirect to HTTPS when running locally.
     app.UseHttpsRedirection();
