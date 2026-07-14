@@ -57,9 +57,19 @@ namespace FlightReadinessEngine.Api.Cache
                 Key datastoreKey = _db.CreateKeyFactory(_kind).CreateKey(key);
                 Entity entity = new Entity
                 {
-                    Key = datastoreKey,
-                    ["value"] = value,
-                    ["updatedAt"] = DateTime.UtcNow.ToString("o")
+                    Key = datastoreKey
+                };
+
+                // Datastore indexed strings are limited to 1500 bytes; cache payloads can be larger.
+                entity.Properties["value"] = new Value
+                {
+                    StringValue = value,
+                    ExcludeFromIndexes = true
+                };
+                entity.Properties["updatedAt"] = new Value
+                {
+                    StringValue = DateTime.UtcNow.ToString("o"),
+                    ExcludeFromIndexes = true
                 };
 
                 await _db.UpsertAsync(entity);

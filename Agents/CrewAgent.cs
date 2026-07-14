@@ -14,6 +14,7 @@ namespace FlightReadinessEngine.Api.Agents
         private readonly IAgentCache _cache;
         private readonly string _projectId;
         private readonly string _location;
+        private const string CachePrefix = "crew_agent";
         private const string ModelId = "gemini-2.5-flash";
 
         public CrewAgent(ILogger<CrewAgent> logger, IAgentCache cache)
@@ -30,6 +31,11 @@ namespace FlightReadinessEngine.Api.Agents
 
             List<string> inputFlightIds = ExtractTargetFlightIds(request);
             bool isTargetedRequest = inputFlightIds.Count > 0;
+
+            if (isTargetedRequest)
+            {
+                return await RunTargetedCacheFirstAsync(inputFlightIds);
+            }
 
             // FIX: Always filter through the cache scanner. 
             // If targeted, it checks if those specific IDs actually have new data compared to the cache.
@@ -56,6 +62,61 @@ namespace FlightReadinessEngine.Api.Agents
             {
                 systemStatus = "SYNCHRONIZATION_COMPLETE",
                 updatedCrewAssessments = crewAssessments
+            };
+        }
+
+        private async Task<object> RunTargetedCacheFirstAsync(List<string> targetTails)
+        {
+            var latestMarkers = await GetLatestMarkersAsync(targetTails);
+            var assessments = new List<object>();
+
+            foreach (var tail in targetTails)
+            {
+                if (!latestMarkers.TryGetValue(tail, out var currentMarker) || string.IsNullOrWhiteSpace(currentMarker))
+                {
+                    assessments.Add(new
+                    {
+                        flightId = tail,
+                        agentDomain = "CREW",
+                        clearanceStatus = "NO_DATA",
+                        domainRiskSummary = "No crew row found for requested tail.",
+                        mitigationSteps = Array.Empty<string>()
+                    });
+                    continue;
+                }
+
+                string markerKey = BuildKey(tail, "last_seen_marker");
+                string rowKey = BuildKey(tail, "latest_row_json");
+                string assessmentKey = BuildKey(tail, "assessment_json");
+                string assessmentMarkerKey = BuildKey(tail, "assessment_marker");
+
+                string cachedAssessmentJson = await SafeGetAsync(assessmentKey);
+                string cachedAssessmentMarker = await SafeGetAsync(assessmentMarkerKey);
+
+                if (!string.IsNullOrWhiteSpace(cachedAssessmentJson) && string.Equals(currentMarker, cachedAssessmentMarker, StringComparison.Ordinal))
+                {
+                    assessments.Add(ParseJsonOrFallback(cachedAssessmentJson, tail));
+                    continue;
+                }
+
+                string rowJson = await TalkToCrewTable(tail);
+                if (!string.IsNullOrWhiteSpace(rowJson) && rowJson != "{}")
+                {
+                    await SafeSetAsync(rowKey, rowJson);
+                }
+
+                string assessmentJson = await EvaluateCrewFromRowAsync(tail, rowJson);
+                assessments.Add(ParseJsonOrFallback(assessmentJson, tail));
+
+                await SafeSetAsync(markerKey, currentMarker);
+                await SafeSetAsync(assessmentMarkerKey, currentMarker);
+                await SafeSetAsync(assessmentKey, assessmentJson);
+            }
+
+            return new
+            {
+                systemStatus = "SYNCHRONIZATION_COMPLETE",
+                updatedCrewAssessments = assessments
             };
         }
 
@@ -93,6 +154,105 @@ namespace FlightReadinessEngine.Api.Agents
         {
             if (json.ValueKind != JsonValueKind.Object || !json.TryGetProperty(propertyName, out var value)) return string.Empty;
             return value.ValueKind == JsonValueKind.String ? value.GetString() ?? string.Empty : value.ToString();
+        }
+
+        private static object ParseJsonOrFallback(string rawJson, string tail)
+        {
+            if (string.IsNullOrWhiteSpace(rawJson))
+            {
+                return new
+                {
+                    flightId = tail,
+                    agentDomain = "CREW",
+                    clearanceStatus = "NO_DATA",
+                    domainRiskSummary = "Empty assessment payload.",
+                    mitigationSteps = Array.Empty<string>()
+                };
+            }
+
+            try
+            {
+                return JsonSerializer.Deserialize<JsonElement>(rawJson);
+            }
+            catch
+            {
+                return new
+                {
+                    flightId = tail,
+                    agentDomain = "CREW",
+                    clearanceStatus = "NO_DATA",
+                    domainRiskSummary = "Invalid assessment payload.",
+                    mitigationSteps = Array.Empty<string>()
+                };
+            }
+        }
+
+        private string BuildKey(string tail, string suffix)
+        {
+            return $"{CachePrefix}:flight:{tail}:{suffix}";
+        }
+
+        private async Task<string> SafeGetAsync(string key)
+        {
+            try
+            {
+                return await _cache.GetStringAsync(key);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[CREW SUBSYSTEM] Cache read failed for key {CacheKey}", key);
+                return string.Empty;
+            }
+        }
+
+        private async Task SafeSetAsync(string key, string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return;
+            }
+
+            try
+            {
+                await _cache.SetStringAsync(key, value);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[CREW SUBSYSTEM] Cache write failed for key {CacheKey}", key);
+            }
+        }
+
+        private async Task<Dictionary<string, string>> GetLatestMarkersAsync(List<string> targetFlightIds)
+        {
+            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId, Services.GcpAuth.GetCredential());
+            var markers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            string query;
+            IEnumerable<BigQueryParameter> parameters;
+
+            if (targetFlightIds.Count == 1)
+            {
+                query = @"SELECT tail, CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `qwiklabs-gcp-04-509f741dc909.aviation_ops_analytics.crew_analytics` WHERE tail = @flightId GROUP BY tail";
+                parameters = new[] { new BigQueryParameter("flightId", BigQueryDbType.String, targetFlightIds[0]) };
+            }
+            else
+            {
+                query = @"SELECT tail, CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `qwiklabs-gcp-04-509f741dc909.aviation_ops_analytics.crew_analytics` WHERE tail IN UNNEST(@flightIds) GROUP BY tail";
+                parameters = new[] { new BigQueryParameter("flightIds", BigQueryDbType.Array, targetFlightIds.ToArray()) };
+            }
+
+            BigQueryResults results = await client.ExecuteQueryAsync(query, parameters);
+            foreach (var row in results)
+            {
+                string tail = row["tail"]?.ToString() ?? string.Empty;
+                string marker = row["latest_marker"]?.ToString() ?? string.Empty;
+                if (!string.IsNullOrWhiteSpace(tail) && !string.IsNullOrWhiteSpace(marker))
+                {
+                    markers[tail] = marker;
+                }
+            }
+
+            return markers;
         }
 
         private async Task<List<string>> ScanTableForChanges(List<string> targetFlightIds)
@@ -185,6 +345,55 @@ namespace FlightReadinessEngine.Api.Agents
             if (!DateTimeOffset.TryParse(currentMarker, out var currentTimestamp)) return true;
             if (DateTimeOffset.TryParse(cachedMarker, out var cachedTimestamp)) return currentTimestamp > cachedTimestamp;
             return true;
+        }
+
+        private async Task<string> EvaluateCrewFromRowAsync(string tail, string rowJson)
+        {
+            var client = await new PredictionServiceClientBuilder
+            {
+                Endpoint = $"{_location}-aiplatform.googleapis.com",
+                TokenAccessMethod = Services.GcpAuth.TokenAccessMethod
+            }.BuildAsync();
+
+            var responseSchema = new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.Object };
+            responseSchema.Properties.Add("flightId", new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.String });
+            responseSchema.Properties.Add("agentDomain", new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.String });
+            responseSchema.Properties.Add("clearanceStatus", new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.String, Description = "MUST be either 'CLEARED' or 'HOLD_DUE_TO_RISK'" });
+            responseSchema.Properties.Add("domainRiskSummary", new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.String });
+            responseSchema.Properties.Add("mitigationSteps", new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.Array, Items = new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.String } });
+            responseSchema.Required.Add("flightId");
+            responseSchema.Required.Add("agentDomain");
+            responseSchema.Required.Add("clearanceStatus");
+            responseSchema.Required.Add("domainRiskSummary");
+            responseSchema.Required.Add("mitigationSteps");
+
+            var request = new GenerateContentRequest
+            {
+                Model = $"projects/{_projectId}/locations/{_location}/publishers/google/models/{ModelId}",
+                Contents =
+                {
+                    new Content
+                    {
+                        Role = "USER",
+                        Parts =
+                        {
+                            new Part
+                            {
+                                Text =
+                                    $"You are the Crew Domain Roster Agent. Analyze the row for tail {tail}. " +
+                                    "Use only the supplied row data and return risk verification assessment JSON.\n\n" +
+                                    "ROW DATA:\n" + rowJson
+                            }
+                        }
+                    }
+                },
+                GenerationConfig = new GenerationConfig { ResponseMimeType = "application/json", ResponseSchema = responseSchema }
+            };
+
+            GenerateContentResponse response = await Services.VertexRetry.InvokeAsync(
+                () => client.GenerateContentAsync(request), _logger, "Crew");
+
+            return response.Candidates[0].Content.Parts[0].Text;
         }
 
         private async Task<string> ExecuteCrewAgentWithTools(string flightId)

@@ -14,6 +14,7 @@ namespace FlightReadinessEngine.Api.Agents
         private readonly IAgentCache _cache;
         private readonly string _projectId;
         private readonly string _location;
+        private const string CachePrefix = "aircraft_agent";
         private const string ModelId = "gemini-2.5-flash";
 
         public AircraftAgent(ILogger<AircraftAgent> logger, IAgentCache cache)
@@ -31,8 +32,11 @@ namespace FlightReadinessEngine.Api.Agents
             List<string> inputFlightIds = ExtractTargetFlightIds(request);
             bool isTargetedRequest = inputFlightIds.Count > 0;
 
-            // FIX: Always filter through the cache scanner. 
-            // If targeted, it checks if those specific IDs actually have new data compared to the cache.
+            if (isTargetedRequest)
+            {
+                return await RunTargetedCacheFirstAsync(inputFlightIds);
+            }
+
             List<string> updatedTails = await ScanTableForChanges(inputFlightIds);
 
             if (!updatedTails.Any())
@@ -50,16 +54,68 @@ namespace FlightReadinessEngine.Api.Agents
                 string structuredAgentOutput = await ExecuteAgentWithTools(tail);
 
                 var parsedJson = JsonSerializer.Deserialize<JsonElement>(structuredAgentOutput);
-                aircraftAssessments.Add(isTargetedRequest ? BuildTargetedResponse(tail, parsedJson) : parsedJson);
+                aircraftAssessments.Add(parsedJson);
             }
-
-            // FIX: UpdateCacheMarkersForTails is completely REMOVED. 
-            // Cache state management is now cleanly handled inside ScanTableForChanges.
 
             return new
             {
                 systemStatus = "SYNCHRONIZATION_COMPLETE",
                 updatedAircraftAssessments = aircraftAssessments
+            };
+        }
+
+        private async Task<object> RunTargetedCacheFirstAsync(List<string> targetTails)
+        {
+            var latestMarkers = await GetLatestMarkersAsync(targetTails);
+            var assessments = new List<object>();
+
+            foreach (var tail in targetTails)
+            {
+                if (!latestMarkers.TryGetValue(tail, out var currentMarker) || string.IsNullOrWhiteSpace(currentMarker))
+                {
+                    assessments.Add(new
+                    {
+                        flightId = tail,
+                        agentDomain = "AIRCRAFT",
+                        clearanceStatus = "NO_DATA",
+                        domainRiskSummary = "No aircraft row found for requested tail.",
+                        mitigationSteps = Array.Empty<string>()
+                    });
+                    continue;
+                }
+
+                string markerKey = BuildKey(tail, "last_seen_marker");
+                string rowKey = BuildKey(tail, "latest_row_json");
+                string assessmentKey = BuildKey(tail, "assessment_json");
+                string assessmentMarkerKey = BuildKey(tail, "assessment_marker");
+
+                string cachedAssessmentJson = await SafeGetAsync(assessmentKey);
+                string cachedAssessmentMarker = await SafeGetAsync(assessmentMarkerKey);
+
+                if (!string.IsNullOrWhiteSpace(cachedAssessmentJson) && string.Equals(currentMarker, cachedAssessmentMarker, StringComparison.Ordinal))
+                {
+                    assessments.Add(ParseJsonOrFallback(cachedAssessmentJson, tail));
+                    continue;
+                }
+
+                string rowJson = await TalkToTable(tail);
+                if (!string.IsNullOrWhiteSpace(rowJson) && rowJson != "{}")
+                {
+                    await SafeSetAsync(rowKey, rowJson);
+                }
+
+                string assessmentJson = await EvaluateAircraftFromRowAsync(tail, rowJson);
+                assessments.Add(ParseJsonOrFallback(assessmentJson, tail));
+
+                await SafeSetAsync(markerKey, currentMarker);
+                await SafeSetAsync(assessmentMarkerKey, currentMarker);
+                await SafeSetAsync(assessmentKey, assessmentJson);
+            }
+
+            return new
+            {
+                systemStatus = "SYNCHRONIZATION_COMPLETE",
+                updatedAircraftAssessments = assessments
             };
         }
 
@@ -71,25 +127,103 @@ namespace FlightReadinessEngine.Api.Agents
             return rawValue.Split(',').Select(id => id.Trim()).Where(id => !string.IsNullOrWhiteSpace(id)).Distinct().ToList();
         }
 
-        private static object BuildTargetedResponse(string requestedTail, JsonElement assessment)
+        private static object ParseJsonOrFallback(string rawJson, string tail)
         {
-            if (assessment.ValueKind != JsonValueKind.Object) return assessment;
-
-            string clearanceStatus = GetJsonStringProperty(assessment, "clearanceStatus");
-            string responseId = GetJsonStringProperty(assessment, "flightId");
-            string effectiveId = string.IsNullOrWhiteSpace(responseId) ? requestedTail : responseId;
-
-            if (string.Equals(clearanceStatus, "CLEARED", StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrWhiteSpace(rawJson))
             {
-                return new { flightId = effectiveId, clearanceStatus = "CLEARED", message = $"{effectiveId} is ready for dispatch. No active risks." };
+                return new
+                {
+                    flightId = tail,
+                    agentDomain = "AIRCRAFT",
+                    clearanceStatus = "NO_DATA",
+                    domainRiskSummary = "Empty assessment payload.",
+                    mitigationSteps = Array.Empty<string>()
+                };
             }
-            return assessment;
+
+            try
+            {
+                return JsonSerializer.Deserialize<JsonElement>(rawJson);
+            }
+            catch
+            {
+                return new
+                {
+                    flightId = tail,
+                    agentDomain = "AIRCRAFT",
+                    clearanceStatus = "NO_DATA",
+                    domainRiskSummary = "Invalid assessment payload.",
+                    mitigationSteps = Array.Empty<string>()
+                };
+            }
         }
 
-        private static string GetJsonStringProperty(JsonElement json, string propertyName)
+        private string BuildKey(string tail, string suffix)
         {
-            if (json.ValueKind != JsonValueKind.Object || !json.TryGetProperty(propertyName, out var value)) return string.Empty;
-            return value.ValueKind == JsonValueKind.String ? value.GetString() ?? string.Empty : value.ToString();
+            return $"{CachePrefix}:flight:{tail}:{suffix}";
+        }
+
+        private async Task<string> SafeGetAsync(string key)
+        {
+            try
+            {
+                return await _cache.GetStringAsync(key);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[AIRCRAFT SUBSYSTEM] Cache read failed for key {CacheKey}", key);
+                return string.Empty;
+            }
+        }
+
+        private async Task SafeSetAsync(string key, string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return;
+            }
+
+            try
+            {
+                await _cache.SetStringAsync(key, value);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[AIRCRAFT SUBSYSTEM] Cache write failed for key {CacheKey}", key);
+            }
+        }
+
+        private async Task<Dictionary<string, string>> GetLatestMarkersAsync(List<string> targetFlightIds)
+        {
+            BigQueryClient client = await BigQueryClient.CreateAsync(_projectId, Services.GcpAuth.GetCredential());
+            var markers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            string query;
+            IEnumerable<BigQueryParameter> parameters;
+
+            if (targetFlightIds.Count == 1)
+            {
+                query = @"SELECT tail, CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `qwiklabs-gcp-04-509f741dc909.aviation_ops_analytics.aircraft_analytics` WHERE tail = @flightId GROUP BY tail";
+                parameters = new[] { new BigQueryParameter("flightId", BigQueryDbType.String, targetFlightIds[0]) };
+            }
+            else
+            {
+                query = @"SELECT tail, CAST(UNIX_MICROS(MAX(last_updated_at)) AS STRING) as latest_marker FROM `qwiklabs-gcp-04-509f741dc909.aviation_ops_analytics.aircraft_analytics` WHERE tail IN UNNEST(@flightIds) GROUP BY tail";
+                parameters = new[] { new BigQueryParameter("flightIds", BigQueryDbType.Array, targetFlightIds.ToArray()) };
+            }
+
+            BigQueryResults results = await client.ExecuteQueryAsync(query, parameters);
+            foreach (var row in results)
+            {
+                string tail = row["tail"]?.ToString() ?? string.Empty;
+                string marker = row["latest_marker"]?.ToString() ?? string.Empty;
+                if (!string.IsNullOrWhiteSpace(tail) && !string.IsNullOrWhiteSpace(marker))
+                {
+                    markers[tail] = marker;
+                }
+            }
+
+            return markers;
         }
 
         private async Task<List<string>> ScanTableForChanges(List<string> targetFlightIds)
@@ -98,8 +232,6 @@ namespace FlightReadinessEngine.Api.Agents
             var tailsWithUpdates = new List<string>();
             bool cacheUnavailable = false;
 
-            // FIX: A targeted request (specific tail(s)) must always return the latest agent status,
-            // even if the BigQuery marker matches the cache. Only untargeted scans filter by change.
             bool isTargetedScan = targetFlightIds != null && targetFlightIds.Count > 0;
 
             string query;
@@ -129,7 +261,7 @@ namespace FlightReadinessEngine.Api.Agents
                 string currentTimestampStr = row["latest_marker"]?.ToString() ?? "";
                 if (string.IsNullOrEmpty(flightId) || string.IsNullOrEmpty(currentTimestampStr)) continue;
 
-                string cacheKey = $"aircraft_agent:flight:{flightId}:last_seen";
+                string cacheKey = BuildKey(flightId, "last_seen");
                 string? cachedTimestampStr = null;
 
                 if (!cacheUnavailable)
@@ -166,6 +298,55 @@ namespace FlightReadinessEngine.Api.Agents
             if (long.TryParse(currentMarker, out _)) return true;
             if (!DateTimeOffset.TryParse(currentMarker, out var ct)) return true;
             return DateTimeOffset.TryParse(cachedMarker, out var cc) ? ct > cc : true;
+        }
+
+        private async Task<string> EvaluateAircraftFromRowAsync(string tail, string rowJson)
+        {
+            var client = await new PredictionServiceClientBuilder
+            {
+                Endpoint = $"{_location}-aiplatform.googleapis.com",
+                TokenAccessMethod = Services.GcpAuth.TokenAccessMethod
+            }.BuildAsync();
+
+            var responseSchema = new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.Object };
+            responseSchema.Properties.Add("flightId", new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.String });
+            responseSchema.Properties.Add("agentDomain", new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.String });
+            responseSchema.Properties.Add("clearanceStatus", new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.String, Description = "MUST be either 'CLEARED' or 'HOLD_DUE_TO_RISK'" });
+            responseSchema.Properties.Add("domainRiskSummary", new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.String });
+            responseSchema.Properties.Add("mitigationSteps", new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.Array, Items = new OpenApiSchema { Type = Google.Cloud.AIPlatform.V1.Type.String } });
+            responseSchema.Required.Add("flightId");
+            responseSchema.Required.Add("agentDomain");
+            responseSchema.Required.Add("clearanceStatus");
+            responseSchema.Required.Add("domainRiskSummary");
+            responseSchema.Required.Add("mitigationSteps");
+
+            var request = new GenerateContentRequest
+            {
+                Model = $"projects/{_projectId}/locations/{_location}/publishers/google/models/{ModelId}",
+                Contents =
+                {
+                    new Content
+                    {
+                        Role = "USER",
+                        Parts =
+                        {
+                            new Part
+                            {
+                                Text =
+                                    $"You are the Aircraft Systems Agent. Analyze the row for tail {tail}. " +
+                                    "Use only the supplied row data and return risk verification assessment JSON.\n\n" +
+                                    "ROW DATA:\n" + rowJson
+                            }
+                        }
+                    }
+                },
+                GenerationConfig = new GenerationConfig { ResponseMimeType = "application/json", ResponseSchema = responseSchema }
+            };
+
+            GenerateContentResponse response = await Services.VertexRetry.InvokeAsync(
+                () => client.GenerateContentAsync(request), _logger, "Aircraft");
+
+            return response.Candidates[0].Content.Parts[0].Text;
         }
 
         private async Task<string> ExecuteAgentWithTools(string tail)
@@ -260,6 +441,5 @@ namespace FlightReadinessEngine.Api.Agents
                 apu_within_guidelines = row["apu_within_guidelines"]?.ToString()
             });
         }
-
-            }
-        }
+    }
+}
